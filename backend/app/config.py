@@ -13,6 +13,11 @@ class Settings(BaseSettings):
 
     retrieval_top_k: int = 8
 
+    # Reranker settings
+    reranker_enabled: bool = True
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    retrieval_candidates: int = 20  # Pre-rerank pool size
+
     llm_model: str = "claude-sonnet-4-20250514"
     llm_max_tokens: int = 2048
 

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import Document
 from app.services.embeddings import embedding_service
 from app.services.bm25_service import bm25_service
+from app.services.reranker import reranker_service
 from app.config import settings
 
 
@@ -246,7 +247,8 @@ class RetrievalService:
         top_k: int = None,
         use_bm25: bool = True,
         section_filters: Optional[list[str]] = None,
-        part_filters: Optional[list[str]] = None
+        part_filters: Optional[list[str]] = None,
+        use_reranker: bool = True
     ) -> list[Document]:
         """Hybrid search combining vector similarity and BM25 with RRF.
 
@@ -256,6 +258,7 @@ class RetrievalService:
             use_bm25: Whether to use BM25 (fallback to vector-only if False or not indexed)
             section_filters: Optional list of section numbers to filter by (e.g., ["164.502"])
             part_filters: Optional list of part numbers to filter by (e.g., ["164"])
+            use_reranker: Whether to apply cross-encoder reranking
 
         Returns:
             List of Document objects sorted by fused relevance
@@ -263,7 +266,12 @@ class RetrievalService:
         if top_k is None:
             top_k = settings.retrieval_top_k
 
-        candidate_pool_size = top_k * 3
+        # If reranker is enabled, over-retrieve to get more candidates for reranking
+        should_rerank = use_reranker and settings.reranker_enabled
+        if should_rerank:
+            candidate_pool_size = settings.retrieval_candidates
+        else:
+            candidate_pool_size = top_k * 3
 
         # Log filter application
         if section_filters:
@@ -277,8 +285,12 @@ class RetrievalService:
         )
 
         if not use_bm25 or not bm25_service.is_indexed:
-            doc_ids = [doc_id for doc_id, _ in vector_results[:top_k]]
-            return await self._fetch_documents_by_ids(doc_ids)
+            doc_ids = [doc_id for doc_id, _ in vector_results]
+            documents = await self._fetch_documents_by_ids(doc_ids)
+            if should_rerank:
+                logger.info(f"Reranking {len(documents)} candidates")
+                documents = reranker_service.rerank(query, documents, top_k)
+            return documents[:top_k]
 
         # For BM25, we need to pre-fetch valid doc IDs to filter
         allowed_doc_ids = await self._get_filtered_doc_ids(section_filters, part_filters)
@@ -287,7 +299,15 @@ class RetrievalService:
 
         fused_doc_ids = self._reciprocal_rank_fusion(vector_results, bm25_results)
 
-        return await self._fetch_documents_by_ids(fused_doc_ids[:top_k])
+        # Fetch more documents if reranking
+        fetch_count = candidate_pool_size if should_rerank else top_k
+        documents = await self._fetch_documents_by_ids(fused_doc_ids[:fetch_count])
+
+        if should_rerank:
+            logger.info(f"Reranking {len(documents)} candidates")
+            documents = reranker_service.rerank(query, documents, top_k)
+
+        return documents[:top_k]
 
     async def get_by_section(self, section_reference: str) -> list[Document]:
         stmt = select(Document).where(
