@@ -106,10 +106,10 @@ Based on the QA audit findings, this document outlines a step-by-step plan to tr
 - **Effort:** 1 hour
 
 **Phase 2 Deliverables:**
-- [x] Citation extraction from queries
-- [x] SQL filter integration
-- [x] Automatic filter application
-- [x] Part/Rule keyword mapping
+- [x] Citation extraction from queries (`backend/app/services/query_analyzer.py`)
+- [x] SQL filter integration (`backend/app/services/retrieval.py`)
+- [x] Automatic filter application (`backend/app/routers/chat.py`)
+- [x] Part/Rule keyword mapping (Privacy Rule, Security Rule, Breach Notification, etc.)
 
 **Testing Checkpoint:**
 - Query "Quote §164.502(a)" should return ONLY chunks from section 164.502

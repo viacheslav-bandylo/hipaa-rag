@@ -1,3 +1,4 @@
+import logging
 import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,7 +7,10 @@ from app.database import get_session
 from app.models import ChatRequest, ChatResponse, SourceReference
 from app.services.retrieval import RetrievalService
 from app.services.llm import llm_service
+from app.services.query_analyzer import query_analyzer
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -30,8 +34,20 @@ async def chat(
             detail="No documents indexed. Please run the ingestion process first via POST /api/ingest"
         )
 
+    # Analyze query for citations and rule references
+    analysis = query_analyzer.analyze(request.message)
+
+    if analysis.section_filters:
+        logger.info(f"Query contains section citations: {analysis.section_filters}")
+    if analysis.part_filters:
+        logger.info(f"Query filtered to parts: {analysis.part_filters}")
+
     if request.use_hybrid_search:
-        relevant_docs = await retrieval_service.hybrid_search(request.message)
+        relevant_docs = await retrieval_service.hybrid_search(
+            request.message,
+            section_filters=analysis.section_filters if analysis.section_filters else None,
+            part_filters=analysis.part_filters if analysis.part_filters else None
+        )
     else:
         relevant_docs = await retrieval_service.search(request.message)
 
