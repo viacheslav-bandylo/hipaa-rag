@@ -30,7 +30,10 @@ async def chat(
             detail="No documents indexed. Please run the ingestion process first via POST /api/ingest"
         )
 
-    relevant_docs = await retrieval_service.search(request.message)
+    if request.use_hybrid_search:
+        relevant_docs = await retrieval_service.hybrid_search(request.message)
+    else:
+        relevant_docs = await retrieval_service.search(request.message)
 
     if not relevant_docs:
         return ChatResponse(

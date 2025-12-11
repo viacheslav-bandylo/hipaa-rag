@@ -1,3 +1,4 @@
+import logging
 import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,7 +8,10 @@ from app.database import get_session, Document
 from app.models import IngestRequest, IngestResponse
 from app.services.pdf_parser import HIPAAParser
 from app.services.embeddings import embedding_service
+from app.services.bm25_service import bm25_service
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ingest", tags=["ingestion"])
 
@@ -76,6 +80,15 @@ async def ingest_document(
         session.add(doc)
 
     await session.commit()
+
+    # 5. Rebuild BM25 index with new documents
+    result = await session.execute(
+        text("SELECT id, content FROM documents ORDER BY id")
+    )
+    rows = result.fetchall()
+    documents_for_bm25 = [(row.id, row.content) for row in rows]
+    bm25_count = bm25_service.build_index(documents_for_bm25)
+    logger.info(f"BM25 index rebuilt with {bm25_count} documents after ingestion")
 
     return IngestResponse(
         status="success",

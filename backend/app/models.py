@@ -5,6 +5,7 @@ from typing import Optional
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    use_hybrid_search: bool = True  # Toggle for A/B testing (True = hybrid, False = vector-only)
 
 
 class SourceReference(BaseModel):
