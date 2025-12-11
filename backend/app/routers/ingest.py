@@ -35,10 +35,12 @@ async def ingest_document(
         await session.execute(text("TRUNCATE TABLE documents RESTART IDENTITY"))
         await session.commit()
 
-    # 2. Parse PDF using the NEW parser logic
+    # 2. Parse PDF using the NEW parser logic with semantic chunking
     parser = HIPAAParser(
         chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap
+        chunk_overlap=settings.chunk_overlap,
+        respect_list_boundaries=settings.respect_list_boundaries,
+        max_list_chunk_size=settings.max_list_chunk_size
     )
 
     chunks = parser.parse_pdf(pdf_path)
@@ -69,8 +71,8 @@ async def ingest_document(
             section_number=chunk.section,
             # Construct a section reference since exact mapping might be gone
             section_reference=ref_str,
-            # New parser does not extract granular paragraph refs (e.g. "(a)(1)")
-            paragraph_reference=None,
+            # Paragraph reference extracted by semantic chunking (e.g. "(a)(1)(i)")
+            paragraph_reference=chunk.paragraph_reference,
             # Map List[int] -> single int
             page_number=primary_page,
             # Use section title as parent context context

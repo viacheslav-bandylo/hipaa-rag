@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 100
 
+    # Semantic chunking settings
+    respect_list_boundaries: bool = True
+    max_list_chunk_size: int = 2000  # Override limit for lists
+
     retrieval_top_k: int = 8
 
     # Reranker settings
