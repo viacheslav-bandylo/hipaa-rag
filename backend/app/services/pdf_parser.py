@@ -1,7 +1,7 @@
 import re
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import pdfplumber
 
 logger = logging.getLogger(__name__)
@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DocumentChunk:
-    content: str
+    content: str  # Pure regulation text WITHOUT context header
     filename: str
     part: Optional[str]  # e.g., "164"
     subpart: Optional[str]  # e.g., "Subpart C"
@@ -18,6 +18,17 @@ class DocumentChunk:
     page_numbers: List[int]  # List because a chunk might span pages
     paragraph_reference: Optional[str] = None  # e.g., "(a)(1)(i)"
     validation_warnings: List[str] = field(default_factory=list)
+    context_header: Optional[str] = None  # Metadata context stored separately
+
+
+@dataclass
+class LineObject:
+    """Represents a line with its visual attributes from pdfplumber."""
+    text: str
+    page_num: int
+    is_bold: bool = False
+    font_size: float = 0.0
+    fontname: str = ""
 
 
 class HIPAAParser:
@@ -66,32 +77,329 @@ class HIPAAParser:
         self.chunk_overlap = chunk_overlap
         self.respect_list_boundaries = respect_list_boundaries
         self.max_list_chunk_size = max_list_chunk_size
+        # Lookahead buffer for handling missed headers
+        self.lookahead_buffer: List[LineObject] = []
+        self.lookahead_size = 3  # Number of lines to buffer before committing
 
     def parse_pdf(self, pdf_path: str) -> List[DocumentChunk]:
         """
-        Parses PDF as a continuous stream to handle cross-page sentences.
+        Parses PDF using visual-semantic header detection.
+        Uses pdfplumber's character-level font data to detect bold headers.
         """
-        full_text_stream = []
+        all_lines: List[LineObject] = []
 
         with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text()
-                if not text:
-                    continue
+                # Extract lines with visual attributes
+                page_lines = self._extract_lines_with_visual_attributes(page, page_num)
+                all_lines.extend(page_lines)
 
-                # Pre-clean headers/footers BEFORE processing to avoid breaking sentences
-                cleaned_lines = []
-                for line in text.split('\n'):
-                    if not self._is_noise(line):
-                        cleaned_lines.append(line)
+        # Filter out noise lines
+        all_lines = [line for line in all_lines if not self._is_noise(line.text)]
 
-                # Store text with page tracking
-                full_text_stream.append((page_num, "\n".join(cleaned_lines)))
-
-        chunks = self._chunk_continuous_stream(full_text_stream, pdf_path)
+        chunks = self._chunk_with_visual_detection(all_lines, pdf_path)
 
         # Post-process to fix any remaining section misattributions
         chunks = self._post_process_chunks(chunks)
+
+        return chunks
+
+    def _extract_lines_with_visual_attributes(self, page, page_num: int) -> List[LineObject]:
+        """
+        Extract lines from a PDF page with their visual attributes (font, bold, size).
+        Uses pdfplumber's character-level data for accurate font detection.
+        """
+        lines = []
+        chars = page.chars
+        if not chars:
+            # Fallback to basic text extraction if no character data
+            text = page.extract_text()
+            if text:
+                for line_text in text.split('\n'):
+                    lines.append(LineObject(
+                        text=line_text,
+                        page_num=page_num,
+                        is_bold=False,
+                        font_size=0.0,
+                        fontname=""
+                    ))
+            return lines
+
+        # Group characters into lines based on y-coordinate (top position)
+        # Characters on the same line have similar 'top' values
+        line_groups: Dict[float, List[Dict[str, Any]]] = {}
+        tolerance = 3  # Pixels tolerance for grouping into same line
+
+        for char in chars:
+            top = round(char.get('top', 0) / tolerance) * tolerance
+            if top not in line_groups:
+                line_groups[top] = []
+            line_groups[top].append(char)
+
+        # Sort line groups by y-position (top to bottom)
+        sorted_tops = sorted(line_groups.keys())
+
+        for top in sorted_tops:
+            char_group = line_groups[top]
+            # Sort characters by x-position (left to right)
+            char_group.sort(key=lambda c: c.get('x0', 0))
+
+            # Build line text and analyze font attributes
+            line_text = ''.join(c.get('text', '') for c in char_group)
+            if not line_text.strip():
+                continue
+
+            # Analyze font attributes - check if majority of chars are bold
+            bold_chars = 0
+            total_chars = 0
+            font_sizes = []
+            fontnames = []
+
+            for char in char_group:
+                char_text = char.get('text', '')
+                if not char_text or char_text.isspace():
+                    continue
+                total_chars += 1
+                fontname = char.get('fontname', '')
+                fontnames.append(fontname)
+                font_sizes.append(char.get('size', 0))
+
+                # Detect bold: common patterns in PDF font names
+                # Bold fonts often contain "Bold", "Bd", "Heavy", "Black", "Demi"
+                if any(bold_indicator in fontname for bold_indicator in
+                       ['Bold', 'Bd', 'Heavy', 'Black', 'Demi', '-B', 'bold']):
+                    bold_chars += 1
+
+            # Line is considered bold if >50% of non-space chars are bold
+            is_bold = bold_chars > (total_chars / 2) if total_chars > 0 else False
+            avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 0.0
+            primary_fontname = max(set(fontnames), key=fontnames.count) if fontnames else ""
+
+            lines.append(LineObject(
+                text=line_text,
+                page_num=page_num,
+                is_bold=is_bold,
+                font_size=avg_font_size,
+                fontname=primary_fontname
+            ))
+
+        return lines
+
+    def _is_header_candidate(self, line: LineObject) -> Optional[Tuple[str, str]]:
+        """
+        Uses visual-semantic detection to identify section headers.
+        Combines regex patterns with font attribute analysis.
+
+        Returns (section_number, section_title) or None.
+        """
+        text = line.text.strip()
+        if not text:
+            return None
+
+        # RELAXED regex check - remove start-of-line anchor to catch merged headers
+        # Pattern catches § followed by section number anywhere in the line
+        section_match = re.search(r'[§\u00A7]\s*(\d+\.\d+)\s+(.*?)(?:\s*$|\s+[§\u00A7])', text)
+        if not section_match:
+            # Try simpler pattern
+            section_match = re.search(r'[§\u00A7]\s*(\d+\.\d+)\s+(.*)$', text)
+
+        if section_match:
+            section_num = section_match.group(1)
+            title = section_match.group(2).strip()
+
+            # Validate section number format
+            if not section_num.startswith(('160.', '162.', '164.')):
+                return None
+
+            # Strong signal: regex match AND (is_bold OR strict anchor match)
+            strict_match = self.SECTION_PATTERN.match(text)
+            if line.is_bold or strict_match:
+                logger.debug(f"Header detected (visual+semantic): §{section_num} - bold={line.is_bold}")
+                return (section_num, title)
+
+            # Medium signal: regex match but not bold - still accept if pattern is clear
+            # This catches headers where PDF font detection failed
+            if strict_match or self.SECTION_WITH_SUBSECTION_PATTERN.match(text):
+                logger.debug(f"Header detected (semantic only): §{section_num}")
+                return (section_num, title)
+
+        # Try fallback pattern (Section 164.502 - Title)
+        fallback_match = self.SECTION_FALLBACK_PATTERN.search(text)
+        if fallback_match:
+            section_num = fallback_match.group(1)
+            title = fallback_match.group(2).strip()
+            if section_num.startswith(('160.', '162.', '164.')):
+                return (section_num, title)
+
+        return None
+
+    def _chunk_with_visual_detection(self, all_lines: List[LineObject], filename: str) -> List[DocumentChunk]:
+        """
+        Chunk the document using visual-semantic header detection with lookahead buffer.
+        This prevents Citation Drift by holding lines in a buffer until we confirm
+        the next lines don't contain a missed header.
+        """
+        chunks = []
+
+        # Context trackers
+        current_part = "General"
+        current_subpart = "General"
+        current_section = None
+        current_section_title = None
+
+        # Buffers
+        current_chunk_lines: List[str] = []
+        current_chunk_len = 0
+        current_chunk_pages = set()
+
+        # List tracking
+        in_list = False
+        last_list_marker: Optional[Tuple[str, str]] = None
+
+        # Lookahead buffer for catching missed headers
+        lookahead_buffer: List[LineObject] = []
+
+        def flush_buffer_to_chunk():
+            """Flush lookahead buffer to current chunk."""
+            nonlocal current_chunk_lines, current_chunk_len, current_chunk_pages
+            for buffered_line in lookahead_buffer:
+                current_chunk_lines.append(buffered_line.text)
+                current_chunk_len += len(buffered_line.text) + 1
+                current_chunk_pages.add(buffered_line.page_num)
+            lookahead_buffer.clear()
+
+        def save_current_chunk():
+            """Save current chunk if it has content."""
+            nonlocal current_chunk_lines, current_chunk_len, current_chunk_pages, in_list, last_list_marker
+            if current_chunk_lines:
+                chunk = self._finalize_chunk(
+                    current_chunk_lines, filename, current_part, current_subpart,
+                    current_section, current_section_title, current_chunk_pages
+                )
+                chunks.append(chunk)
+                current_chunk_lines = []
+                current_chunk_len = 0
+                current_chunk_pages = set()
+                in_list = False
+                last_list_marker = None
+
+        i = 0
+        while i < len(all_lines):
+            line = all_lines[i]
+
+            # 1. Check for Part/Subpart changes (structural hierarchy)
+            part_match = self.PART_PATTERN.search(line.text)
+            if part_match:
+                flush_buffer_to_chunk()
+                current_part = part_match.group(1)
+                current_subpart = "General"
+                current_section = None
+                i += 1
+                continue
+
+            subpart_match = self.SUBPART_PATTERN.search(line.text)
+            if subpart_match:
+                flush_buffer_to_chunk()
+                current_subpart = f"Subpart {subpart_match.group(1)}"
+                i += 1
+                continue
+
+            # 2. Use visual-semantic header detection
+            section_match = self._is_header_candidate(line)
+            if section_match:
+                new_section, new_title = section_match
+
+                if new_section != current_section:
+                    logger.debug(f"Section transition: {current_section} -> {new_section} on page {line.page_num}")
+
+                    # Before saving, check lookahead buffer for content that should stay
+                    # with the OLD section vs content that belongs to NEW section
+                    flush_buffer_to_chunk()
+                    save_current_chunk()
+
+                    current_section = new_section
+                    current_section_title = new_title
+                    logger.info(f"Now processing section § {current_section}: {current_section_title}")
+
+            # Skip TOC lines
+            if re.search(r"\.{5,}\s*\d+$", line.text):
+                i += 1
+                continue
+
+            # 3. Lookahead buffer logic
+            # Add line to buffer first, then check if we should commit older buffer entries
+            lookahead_buffer.append(line)
+
+            # Check if any of the NEXT few lines might be a header we'd miss
+            # If buffer is full and no header detected in upcoming lines, commit oldest
+            if len(lookahead_buffer) >= self.lookahead_size:
+                # Check upcoming lines for headers
+                header_in_lookahead = False
+                for j in range(1, len(lookahead_buffer)):
+                    if self._is_header_candidate(lookahead_buffer[j]):
+                        header_in_lookahead = True
+                        break
+
+                if not header_in_lookahead:
+                    # Safe to commit oldest line from buffer
+                    oldest_line = lookahead_buffer.pop(0)
+                    current_chunk_lines.append(oldest_line.text)
+                    current_chunk_len += len(oldest_line.text) + 1
+                    current_chunk_pages.add(oldest_line.page_num)
+
+                    # Track list state
+                    marker = self._detect_list_marker(oldest_line.text)
+                    if marker:
+                        in_list = True
+                        last_list_marker = marker
+                    elif not oldest_line.text.strip():
+                        # Empty line might end list
+                        pass
+
+            # 4. Check chunk size limits
+            effective_limit = self.max_list_chunk_size if in_list else self.chunk_size
+
+            if current_chunk_len >= effective_limit:
+                if in_list and current_chunk_len < self.max_list_chunk_size:
+                    i += 1
+                    continue
+
+                # Find best break point
+                if len(current_chunk_lines) > 1:
+                    target_break = len(current_chunk_lines) - 1
+                    if not in_list:
+                        target_break = self._find_best_break_point(
+                            current_chunk_lines,
+                            len(current_chunk_lines) * self.chunk_size // current_chunk_len
+                        )
+
+                    chunk_lines = current_chunk_lines[:target_break]
+                    remaining_lines = current_chunk_lines[target_break:]
+
+                    if chunk_lines:
+                        chunk = self._finalize_chunk(
+                            chunk_lines, filename, current_part, current_subpart,
+                            current_section, current_section_title, current_chunk_pages
+                        )
+                        chunks.append(chunk)
+
+                    # Apply overlap
+                    overlap_lines = []
+                    overlap_len = 0
+                    for prev_line in reversed(chunk_lines):
+                        if overlap_len >= self.chunk_overlap:
+                            break
+                        overlap_lines.insert(0, prev_line)
+                        overlap_len += len(prev_line) + 1
+
+                    current_chunk_lines = overlap_lines + remaining_lines
+                    current_chunk_len = sum(len(l) + 1 for l in current_chunk_lines)
+
+            i += 1
+
+        # Final flush - commit any remaining buffer content
+        flush_buffer_to_chunk()
+        save_current_chunk()
 
         return chunks
 
@@ -557,11 +865,12 @@ class HIPAAParser:
         return warnings
 
     def _finalize_chunk(self, lines, filename, part, subpart, section, title, pages):
+        # DECOUPLED: Store pure regulation text WITHOUT context header
+        # Context header is stored separately for clean data architecture
         content = "\n".join(lines).strip()
-        # Enrich content with context string for better embedding retrieval
-        # This prepends "Part 164 | Subpart C..." to the actual text content
-        context_header = f"HIPAA Part {part} | {subpart} | Section {section} - {title}\n"
-        full_content = context_header + content
+
+        # Build context header separately - will be used at embedding time
+        context_header = f"HIPAA Part {part} | {subpart} | Section {section} - {title}"
 
         # Extract paragraph reference
         paragraph_ref = self._extract_paragraph_reference(lines)
@@ -573,7 +882,7 @@ class HIPAAParser:
                 logger.warning(f"Chunk validation [{section}]: {warning}")
 
         return DocumentChunk(
-            content=full_content,
+            content=content,  # Pure text only, no metadata prefix
             filename=filename,
             part=part,
             subpart=subpart,
@@ -581,7 +890,8 @@ class HIPAAParser:
             section_title=title,
             page_numbers=sorted(list(pages)),
             paragraph_reference=paragraph_ref,
-            validation_warnings=warnings
+            validation_warnings=warnings,
+            context_header=context_header  # Metadata stored separately
         )
 
     def _post_process_chunks(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
@@ -593,13 +903,8 @@ class HIPAAParser:
         corrected_chunks = []
 
         for chunk in chunks:
-            # Parse the content to find section boundaries
-            # Skip the context header line we prepend
-            lines = chunk.content.split('\n')
-            if lines and lines[0].startswith('HIPAA Part'):
-                content_lines = lines[1:]  # Skip context header
-            else:
-                content_lines = lines
+            # Content is now pure text (no context header prefix)
+            content_lines = chunk.content.split('\n')
 
             # Find any section headers in the content
             section_indices = []
@@ -631,9 +936,10 @@ class HIPAAParser:
                     sub_lines = content_lines[prev_idx:idx]
                     sub_content = '\n'.join(sub_lines).strip()
                     if sub_content:
-                        context_header = f"HIPAA Part {chunk.part} | {chunk.subpart} | Section {current_section} - {current_title}\n"
+                        # DECOUPLED: Store context header separately
+                        context_header = f"HIPAA Part {chunk.part} | {chunk.subpart} | Section {current_section} - {current_title}"
                         corrected_chunks.append(DocumentChunk(
-                            content=context_header + sub_content,
+                            content=sub_content,  # Pure text only
                             filename=chunk.filename,
                             part=chunk.part,
                             subpart=chunk.subpart,
@@ -641,7 +947,8 @@ class HIPAAParser:
                             section_title=current_title,
                             page_numbers=chunk.page_numbers,
                             paragraph_reference=self._extract_paragraph_reference(sub_lines),
-                            validation_warnings=[]
+                            validation_warnings=[],
+                            context_header=context_header
                         ))
 
                 # Update current section for next segment
@@ -654,9 +961,10 @@ class HIPAAParser:
                 sub_lines = content_lines[prev_idx:]
                 sub_content = '\n'.join(sub_lines).strip()
                 if sub_content:
-                    context_header = f"HIPAA Part {chunk.part} | {chunk.subpart} | Section {current_section} - {current_title}\n"
+                    # DECOUPLED: Store context header separately
+                    context_header = f"HIPAA Part {chunk.part} | {chunk.subpart} | Section {current_section} - {current_title}"
                     corrected_chunks.append(DocumentChunk(
-                        content=context_header + sub_content,
+                        content=sub_content,  # Pure text only
                         filename=chunk.filename,
                         part=chunk.part,
                         subpart=chunk.subpart,
@@ -664,7 +972,8 @@ class HIPAAParser:
                         section_title=current_title,
                         page_numbers=chunk.page_numbers,
                         paragraph_reference=self._extract_paragraph_reference(sub_lines),
-                        validation_warnings=[]
+                        validation_warnings=[],
+                        context_header=context_header
                     ))
 
         logger.info(f"Post-processing: {len(chunks)} chunks -> {len(corrected_chunks)} chunks")
