@@ -22,10 +22,17 @@ class DocumentChunk:
 
 class HIPAAParser:
     # Regex patterns refined for accuracy
-    PART_PATTERN = re.compile(r"^PART\s+(\d+)", re.IGNORECASE | re.MULTILINE)
-    SUBPART_PATTERN = re.compile(r"^SUBPART\s+([A-Z])", re.IGNORECASE | re.MULTILINE)
-    # Catches "§ 164.308 Administrative safeguards."
-    SECTION_PATTERN = re.compile(r"^§\s*(\d+\.\d+)\s+(.*)$", re.MULTILINE)
+    PART_PATTERN = re.compile(r"^\s*PART\s+(\d+)", re.IGNORECASE | re.MULTILINE)
+    SUBPART_PATTERN = re.compile(r"^\s*SUBPART\s+([A-Z])", re.IGNORECASE | re.MULTILINE)
+    # Catches "§ 164.308 Administrative safeguards." - handles leading whitespace and Unicode
+    # The § symbol can appear as U+00A7 or other Unicode variants
+    SECTION_PATTERN = re.compile(r"^\s*[§\u00A7]\s*(\d+\.\d+)\s+(.*)$", re.MULTILINE)
+    # Fallback pattern for inline section references (e.g., "Section 164.502")
+    SECTION_FALLBACK_PATTERN = re.compile(r"^\s*Section\s+(\d+\.\d+)\s*[-–—]?\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+    # Pattern to detect section headers that might be split or have subsection markers
+    SECTION_WITH_SUBSECTION_PATTERN = re.compile(r"^\s*[§\u00A7]\s*(\d+\.\d+)(?:\([a-z]\))?\s+(.*)$", re.MULTILINE)
+    # Pattern to detect section references within text (for validation)
+    INLINE_SECTION_REF_PATTERN = re.compile(r'[§\u00A7]\s*(\d+\.\d+)')
 
     # Header/Footer noise to ignore
     NOISE_PATTERNS = [
@@ -81,7 +88,12 @@ class HIPAAParser:
                 # Store text with page tracking
                 full_text_stream.append((page_num, "\n".join(cleaned_lines)))
 
-        return self._chunk_continuous_stream(full_text_stream, pdf_path)
+        chunks = self._chunk_continuous_stream(full_text_stream, pdf_path)
+
+        # Post-process to fix any remaining section misattributions
+        chunks = self._post_process_chunks(chunks)
+
+        return chunks
 
     def _is_noise(self, line: str) -> bool:
         line = line.strip()
@@ -134,6 +146,49 @@ class HIPAAParser:
             return True
 
         return False
+
+    def _detect_section_header(self, line: str) -> Optional[Tuple[str, str]]:
+        """
+        Detect if a line is a section header using multiple patterns.
+        Returns (section_number, section_title) or None.
+
+        This uses a cascade of patterns to handle various PDF extraction quirks:
+        1. Standard § symbol with number
+        2. "Section" word prefix
+        3. § with subsection markers like §164.308(a)
+        """
+        # Normalize the line - handle various Unicode whitespace and § variants
+        normalized_line = line.strip()
+
+        # Also check for common OCR errors: § might become S, s, or other characters
+        # But be careful not to match false positives
+
+        # Try primary pattern (§ 164.502 Title)
+        match = self.SECTION_PATTERN.search(line)
+        if match:
+            section_num = match.group(1)
+            title = match.group(2).strip()
+            # Validate section number format (should be like 160.xxx, 162.xxx, or 164.xxx)
+            if section_num.startswith(('160.', '162.', '164.')):
+                return (section_num, title)
+
+        # Try pattern with subsection marker (§ 164.308(a) Title)
+        match = self.SECTION_WITH_SUBSECTION_PATTERN.search(line)
+        if match:
+            section_num = match.group(1)
+            title = match.group(2).strip()
+            if section_num.startswith(('160.', '162.', '164.')):
+                return (section_num, title)
+
+        # Try fallback pattern (Section 164.502 - Title)
+        match = self.SECTION_FALLBACK_PATTERN.search(line)
+        if match:
+            section_num = match.group(1)
+            title = match.group(2).strip()
+            if section_num.startswith(('160.', '162.', '164.')):
+                return (section_num, title)
+
+        return None
 
     def _is_paragraph_boundary(self, line: str, prev_line: Optional[str]) -> bool:
         """Detect if we're at a paragraph boundary."""
@@ -304,23 +359,31 @@ class HIPAAParser:
                 continue
 
             # Check for Section change - ALWAYS break here (highest priority)
-            section_match = self.SECTION_PATTERN.search(line)
+            # Try multiple patterns to catch different section header formats
+            section_match = self._detect_section_header(line)
             if section_match:
-                # Save previous chunk if it exists
-                if current_chunk_lines:
-                    chunk = self._finalize_chunk(
-                        current_chunk_lines, filename, current_part, current_subpart,
-                        current_section, current_section_title, current_chunk_pages
-                    )
-                    chunks.append(chunk)
-                    current_chunk_lines = []
-                    current_chunk_len = 0
-                    current_chunk_pages = set()
-                    in_list = False
-                    last_list_marker = None
+                new_section, new_title = section_match
 
-                current_section = section_match.group(1)
-                current_section_title = section_match.group(2).strip()
+                # Only treat as section break if this is a DIFFERENT section
+                if new_section != current_section:
+                    logger.debug(f"Section transition detected: {current_section} -> {new_section} on page {page_num}")
+
+                    # Save previous chunk if it exists
+                    if current_chunk_lines:
+                        chunk = self._finalize_chunk(
+                            current_chunk_lines, filename, current_part, current_subpart,
+                            current_section, current_section_title, current_chunk_pages
+                        )
+                        chunks.append(chunk)
+                        current_chunk_lines = []
+                        current_chunk_len = 0
+                        current_chunk_pages = set()
+                        in_list = False
+                        last_list_marker = None
+
+                    current_section = new_section
+                    current_section_title = new_title
+                    logger.info(f"Now processing section § {current_section}: {current_section_title}")
 
             # Skip TOC lines
             if re.search(r"\.{5,}\s*\d+$", line):
@@ -417,7 +480,7 @@ class HIPAAParser:
 
         return chunks
 
-    def _validate_chunk(self, lines: List[str]) -> List[str]:
+    def _validate_chunk(self, lines: List[str], assigned_section: Optional[str] = None) -> List[str]:
         """
         Validate chunk for potential issues.
         Returns list of warning messages.
@@ -455,6 +518,42 @@ class HIPAAParser:
         if len(content) < 100 and lines:
             warnings.append("Very short chunk, may be fragment")
 
+        # CRITICAL: Check for section mismatch - detect if chunk content references
+        # a different section than what it's being assigned to
+        if assigned_section:
+            # Look for section headers within the chunk that don't match assigned section
+            for line in lines:
+                header_match = self._detect_section_header(line)
+                if header_match:
+                    detected_section, detected_title = header_match
+                    if detected_section != assigned_section:
+                        warnings.append(
+                            f"SECTION_MISMATCH: Content contains header for §{detected_section} "
+                            f"but chunk is assigned to §{assigned_section}"
+                        )
+                        logger.error(
+                            f"Section mismatch detected! Chunk assigned to {assigned_section} "
+                            f"but contains header for {detected_section}: '{detected_title}'"
+                        )
+
+            # Also check for inline section references that might indicate misattribution
+            inline_refs = self.INLINE_SECTION_REF_PATTERN.findall(content)
+            # Filter to unique section numbers that appear prominently (not just cross-references)
+            prominent_sections = set()
+            for ref in inline_refs:
+                # Only flag if this section appears at start of a line (likely a header we missed)
+                for line in lines:
+                    if line.strip().startswith(f"§{ref}") or line.strip().startswith(f"§ {ref}"):
+                        prominent_sections.add(ref)
+
+            for ref_section in prominent_sections:
+                if ref_section != assigned_section and ref_section.startswith(('160.', '162.', '164.')):
+                    # This is a different HIPAA section mentioned prominently
+                    warnings.append(
+                        f"POSSIBLE_MISATTRIBUTION: Chunk references §{ref_section} prominently "
+                        f"but is assigned to §{assigned_section}"
+                    )
+
         return warnings
 
     def _finalize_chunk(self, lines, filename, part, subpart, section, title, pages):
@@ -467,8 +566,8 @@ class HIPAAParser:
         # Extract paragraph reference
         paragraph_ref = self._extract_paragraph_reference(lines)
 
-        # Validate chunk
-        warnings = self._validate_chunk(lines)
+        # Validate chunk - pass section for mismatch detection
+        warnings = self._validate_chunk(lines, assigned_section=section)
         if warnings:
             for warning in warnings:
                 logger.warning(f"Chunk validation [{section}]: {warning}")
@@ -484,3 +583,89 @@ class HIPAAParser:
             paragraph_reference=paragraph_ref,
             validation_warnings=warnings
         )
+
+    def _post_process_chunks(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """
+        Post-process chunks to fix section misattributions.
+        If a chunk contains a section header for a DIFFERENT section,
+        split it at that boundary.
+        """
+        corrected_chunks = []
+
+        for chunk in chunks:
+            # Parse the content to find section boundaries
+            # Skip the context header line we prepend
+            lines = chunk.content.split('\n')
+            if lines and lines[0].startswith('HIPAA Part'):
+                content_lines = lines[1:]  # Skip context header
+            else:
+                content_lines = lines
+
+            # Find any section headers in the content
+            section_indices = []
+            for i, line in enumerate(content_lines):
+                header_match = self._detect_section_header(line)
+                if header_match:
+                    detected_section, detected_title = header_match
+                    if detected_section != chunk.section:
+                        section_indices.append((i, detected_section, detected_title))
+                        logger.warning(
+                            f"Post-process: Found §{detected_section} in chunk assigned to §{chunk.section}"
+                        )
+
+            # If no mismatched sections, keep chunk as-is
+            if not section_indices:
+                corrected_chunks.append(chunk)
+                continue
+
+            # Split the chunk at section boundaries
+            logger.info(f"Splitting chunk §{chunk.section} due to embedded section headers")
+
+            prev_idx = 0
+            current_section = chunk.section
+            current_title = chunk.section_title
+
+            for idx, new_section, new_title in section_indices:
+                # Create chunk for content before this section header
+                if idx > prev_idx:
+                    sub_lines = content_lines[prev_idx:idx]
+                    sub_content = '\n'.join(sub_lines).strip()
+                    if sub_content:
+                        context_header = f"HIPAA Part {chunk.part} | {chunk.subpart} | Section {current_section} - {current_title}\n"
+                        corrected_chunks.append(DocumentChunk(
+                            content=context_header + sub_content,
+                            filename=chunk.filename,
+                            part=chunk.part,
+                            subpart=chunk.subpart,
+                            section=current_section,
+                            section_title=current_title,
+                            page_numbers=chunk.page_numbers,
+                            paragraph_reference=self._extract_paragraph_reference(sub_lines),
+                            validation_warnings=[]
+                        ))
+
+                # Update current section for next segment
+                current_section = new_section
+                current_title = new_title
+                prev_idx = idx
+
+            # Create final chunk for remaining content
+            if prev_idx < len(content_lines):
+                sub_lines = content_lines[prev_idx:]
+                sub_content = '\n'.join(sub_lines).strip()
+                if sub_content:
+                    context_header = f"HIPAA Part {chunk.part} | {chunk.subpart} | Section {current_section} - {current_title}\n"
+                    corrected_chunks.append(DocumentChunk(
+                        content=context_header + sub_content,
+                        filename=chunk.filename,
+                        part=chunk.part,
+                        subpart=chunk.subpart,
+                        section=current_section,
+                        section_title=current_title,
+                        page_numbers=chunk.page_numbers,
+                        paragraph_reference=self._extract_paragraph_reference(sub_lines),
+                        validation_warnings=[]
+                    ))
+
+        logger.info(f"Post-processing: {len(chunks)} chunks -> {len(corrected_chunks)} chunks")
+        return corrected_chunks
