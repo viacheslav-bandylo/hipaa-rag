@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     retrieval_candidates: int = 20  # Pre-rerank pool size
 
-    llm_model: str = "claude-sonnet-4-20250514"
-    llm_max_tokens: int = 2048
+    llm_model: str = "claude-sonnet-4.5"
+    llm_max_tokens: int = 10000
 
     pdf_path: str = "/app/data/HIPAA_questions.pdf"
 
